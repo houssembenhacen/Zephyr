@@ -1,0 +1,653 @@
+package imap
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/hkdb/aerion/internal/logging"
+	"github.com/rs/zerolog"
+)
+
+// IsConnectionError checks if an error indicates a dead/broken connection.
+// These errors warrant discarding the connection and getting a new one from the pool.
+func IsConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	connectionErrors := []string{
+		"use of closed network connection",
+		"connection reset",
+		"broken pipe",
+		"EOF",
+		"i/o timeout",
+		"connection refused",
+		"no such host",
+		"network is unreachable",
+	}
+	for _, connErr := range connectionErrors {
+		if strings.Contains(errStr, connErr) {
+			return true
+		}
+	}
+	return false
+}
+
+// PoolConfig configures the connection pool
+type PoolConfig struct {
+	// MaxConnections is the maximum number of connections per account
+	MaxConnections int
+
+	// IdleTimeout is how long a connection can be idle before being closed
+	IdleTimeout time.Duration
+
+	// ConnectTimeout is how long to wait for a connection to be established
+	ConnectTimeout time.Duration
+
+	// WaiterTimeout is max time to wait for a connection when pool is exhausted
+	WaiterTimeout time.Duration
+}
+
+// DefaultPoolConfig returns sensible defaults for the pool
+func DefaultPoolConfig() PoolConfig {
+	return PoolConfig{
+		MaxConnections: 4,                // up to 3 body fetches + header/STATUS work; IDLE holds a 5th outside the pool. Provider limits (Gmail ~15, Dovecot default 10) are shared across every client on the account
+		IdleTimeout:    15 * time.Minute, // longer than a typical scheduler interval so passes reuse logins
+		ConnectTimeout: 30 * time.Second,
+		WaiterTimeout:  2 * time.Minute, // Don't wait forever for a connection
+	}
+}
+
+// PooledConnection wraps a Client with pool metadata
+type PooledConnection struct {
+	client    *Client
+	accountID string
+	createdAt time.Time
+	lastUsed  time.Time
+	inUse     bool
+	mu        sync.Mutex
+}
+
+// isHealthyLocked checks health without acquiring lock (caller must hold lock).
+// Sends a NOOP to verify the connection is alive — catches closed sockets
+// that still have non-nil client references (e.g., after server-side disconnect).
+func (pc *PooledConnection) isHealthyLocked() bool {
+	if pc.client == nil || pc.client.client == nil {
+		return false
+	}
+
+	// Send NOOP to verify the connection is actually alive.
+	// This catches closed sockets (e.g., Proton Bridge dropping idle connections).
+	if err := pc.client.client.Noop().Wait(); err != nil {
+		return false
+	}
+	return true
+}
+
+// Pool manages IMAP connections for multiple accounts
+type Pool struct {
+	config      PoolConfig
+	connections map[string][]*PooledConnection // accountID -> connections
+	waiters     map[string][]chan *PooledConnection
+	// pending counts connections being created per account. Reserved under
+	// mu BEFORE the (unlocked) connect so concurrent acquisitions can't all
+	// pass the size check and overshoot MaxConnections.
+	pending map[string]int
+	// createGate bounds connection creation per account to createConcurrency
+	// logins in flight. Gmail rate-shapes a burst of simultaneous logins from
+	// one client: five inside ~2 s cost the last one a 25 s login and a 19 s
+	// first command, while the first four answered in ~1 s. Generic providers
+	// never objected, so the gate is wide enough not to serialize them.
+	createGate map[string]chan struct{}
+	mu         sync.Mutex
+	log        zerolog.Logger
+
+	// Credentials provider function
+	getCredentials func(accountID string) (*ClientConfig, error)
+
+	// idRequiredCallback is invoked once a login for the account only
+	// succeeded after an IMAP ID command (Client.IDRequired); the app
+	// persists the flag so later credentials carry SendID.
+	idRequiredCallback func(accountID string)
+}
+
+// SetIDRequiredCallback registers the function called when an account is
+// found to require an IMAP ID command before login (#457).
+func (p *Pool) SetIDRequiredCallback(cb func(accountID string)) {
+	p.idRequiredCallback = cb
+}
+
+// NewPool creates a new connection pool
+func NewPool(config PoolConfig, getCredentials func(accountID string) (*ClientConfig, error)) *Pool {
+	return &Pool{
+		config:         config,
+		connections:    make(map[string][]*PooledConnection),
+		waiters:        make(map[string][]chan *PooledConnection),
+		pending:        make(map[string]int),
+		createGate:     make(map[string]chan struct{}),
+		log:            logging.WithComponent("imap-pool"),
+		getCredentials: getCredentials,
+	}
+}
+
+// healthProbeFreshWindow: a connection released this recently just passed the
+// release-time NOOP probe, so probing it again adds nothing but a server round
+// trip taken under the global pool lock (Gmail: 0.5–2.5 s each, which
+// serialized a 44-folder STATUS pass into ~66 s). Kept short so a localhost
+// bridge that drops idle connections quickly (Proton) can't hand us a dead one
+// for long; the burst cases this exists for reuse connections within
+// milliseconds. Older idle connections are still probed under the lock so a
+// stuck one blocks the rest, as intended. This only holds because Release
+// DISCARDS unhealthy connections — a dead one must never sit in the pool with
+// a fresh lastUsed.
+const healthProbeFreshWindow = 10 * time.Second
+
+// probeIfStaleLocked reports whether an idle connection is usable. Connections
+// released within healthProbeFreshWindow are trusted without a NOOP; anything
+// older is probed. Caller holds p.mu and conn.mu.
+func (p *Pool) probeIfStaleLocked(conn *PooledConnection, accountID string) bool {
+	// A connection with no client is dead regardless of how fresh it looks.
+	if conn.client == nil || conn.client.client == nil {
+		return false
+	}
+	if time.Since(conn.lastUsed) < healthProbeFreshWindow {
+		return true
+	}
+	healthStart := time.Now()
+	healthy := conn.isHealthyLocked()
+	if d := time.Since(healthStart); d > 2*time.Second {
+		p.log.Warn().
+			Str("account", accountID).
+			Dur("healthCheck", d).
+			Msg("Slow NOOP health check while holding pool lock")
+	}
+	return healthy
+}
+
+// MaxConnections returns the per-account connection cap.
+func (p *Pool) MaxConnections() int {
+	return p.config.MaxConnections
+}
+
+// reserveSlotLocked claims a creation slot for the account if live plus
+// in-flight connections are below the cap. Caller holds p.mu.
+func (p *Pool) reserveSlotLocked(accountID string) bool {
+	if len(p.connections[accountID])+p.pending[accountID] >= p.config.MaxConnections {
+		return false
+	}
+	p.pending[accountID]++
+	return true
+}
+
+// unreserveSlot releases a creation slot claimed by reserveSlotLocked.
+func (p *Pool) unreserveSlot(accountID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pending[accountID] <= 1 {
+		delete(p.pending, accountID)
+		return
+	}
+	p.pending[accountID]--
+}
+
+// createConcurrency is how many logins may be in flight per account at once.
+// Observed Gmail behaviour (2026-10-27): four logins within ~2 s were fine,
+// the fifth was slow-walked. The folder stage pipelines STATUS over two
+// connections (one of them the reused LIST connection), so a cold pass needs
+// at most two fresh logins at once; two keeps a clear margin under the limit.
+const createConcurrency = 2
+
+// gateForLocked returns the account's creation gate (buffered
+// createConcurrency), creating it on first use. Caller holds p.mu.
+func (p *Pool) gateForLocked(accountID string) chan struct{} {
+	gate, ok := p.createGate[accountID]
+	if ok {
+		return gate
+	}
+	gate = make(chan struct{}, createConcurrency)
+	p.createGate[accountID] = gate
+	return gate
+}
+
+// GetConnection gets or creates a connection for an account
+func (p *Pool) GetConnection(ctx context.Context, accountID string) (*PooledConnection, error) {
+	acquireStart := time.Now()
+	p.mu.Lock()
+
+	// Try to find an available connection
+	if conns, ok := p.connections[accountID]; ok {
+		for _, conn := range conns {
+			conn.mu.Lock()
+			if conn.inUse {
+				conn.mu.Unlock()
+				continue
+			}
+			// The NOOP health probe runs while p.mu is held — a half-dead socket
+			// stalls every acquisition in the app until its read deadline. Time
+			// it so that stall is visible in the log instead of inferred.
+			healthy := p.probeIfStaleLocked(conn, accountID)
+			if !healthy {
+				conn.mu.Unlock()
+				continue
+			}
+			conn.inUse = true
+			conn.lastUsed = time.Now()
+			conn.mu.Unlock()
+			poolSize := len(conns)
+			p.mu.Unlock()
+
+			p.log.Debug().
+				Str("account", accountID).
+				Dur("acquire", time.Since(acquireStart)).
+				Int("poolSize", poolSize).
+				Msg("Reusing existing connection")
+			return conn, nil
+		}
+	}
+
+	// Count current connections for this account (live + being created)
+	currentCount := len(p.connections[accountID]) + p.pending[accountID]
+
+	// Can we create a new one? The slot is reserved under the lock so the
+	// pool never overshoots MaxConnections, then the login itself is bounded
+	// per account by the creation gate.
+	if p.reserveSlotLocked(accountID) {
+		gate := p.gateForLocked(accountID)
+		p.mu.Unlock()
+		defer p.unreserveSlot(accountID)
+
+		select {
+		case gate <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		conn, err := p.createConnection(ctx, accountID)
+		<-gate
+		if err != nil {
+			return nil, err
+		}
+
+		p.mu.Lock()
+		poolSize := len(p.connections[accountID])
+		p.mu.Unlock()
+		p.log.Debug().
+			Str("account", accountID).
+			Dur("acquire", time.Since(acquireStart)).
+			Int("poolSize", poolSize).
+			Msg("Created new connection")
+		return conn, nil
+	}
+
+	// At limit - must wait
+	p.log.Debug().
+		Str("account", accountID).
+		Int("current", currentCount).
+		Int("max", p.config.MaxConnections).
+		Msg("Connection pool exhausted, waiting")
+
+	waiter := make(chan *PooledConnection, 1)
+	p.waiters[accountID] = append(p.waiters[accountID], waiter)
+	p.mu.Unlock()
+
+	// Wait for a connection, context cancellation, or timeout
+	select {
+	case conn := <-waiter:
+		if conn == nil {
+			// Channel was closed by CloseAccount/CloseAll — pool is being cleared
+			return nil, fmt.Errorf("connection pool closed")
+		}
+		p.log.Debug().
+			Str("account", accountID).
+			Dur("acquire", time.Since(acquireStart)).
+			Msg("Acquired connection from waiter queue")
+		return conn, nil
+	case <-ctx.Done():
+		// Remove ourselves from waiters
+		p.mu.Lock()
+		waiters := p.waiters[accountID]
+		for i, w := range waiters {
+			if w == waiter {
+				p.waiters[accountID] = append(waiters[:i], waiters[i+1:]...)
+				break
+			}
+		}
+		p.mu.Unlock()
+		return nil, ctx.Err()
+	case <-time.After(p.config.WaiterTimeout):
+		// Timeout waiting for connection - pool may be deadlocked
+		p.mu.Lock()
+		waiters := p.waiters[accountID]
+		for i, w := range waiters {
+			if w == waiter {
+				p.waiters[accountID] = append(waiters[:i], waiters[i+1:]...)
+				break
+			}
+		}
+		p.mu.Unlock()
+		p.log.Warn().
+			Str("account", accountID).
+			Dur("timeout", p.config.WaiterTimeout).
+			Msg("Timed out waiting for connection from pool")
+		return nil, fmt.Errorf("timed out waiting for connection from pool")
+	}
+}
+
+// createConnection creates a new connection for an account
+func (p *Pool) createConnection(ctx context.Context, accountID string) (*PooledConnection, error) {
+	return p.createConnectionWithRetry(ctx, accountID, 0)
+}
+
+// createConnectionWithRetry creates a connection with retry logic for transient errors
+// like "max connections exceeded" (server still has ghost connections after network change).
+func (p *Pool) createConnectionWithRetry(ctx context.Context, accountID string, attempt int) (*PooledConnection, error) {
+	p.log.Debug().
+		Str("account", accountID).
+		Msg("Creating new connection")
+
+	// Get credentials for this account
+	config, err := p.getCredentials(accountID)
+	if err != nil {
+		p.log.Error().Err(err).Str("account", accountID).Msg("Failed to get credentials")
+		return nil, fmt.Errorf("failed to get credentials: %w", err)
+	}
+
+	p.log.Debug().
+		Str("account", accountID).
+		Str("host", config.Host).
+		Int("port", config.Port).
+		Str("authType", string(config.AuthType)).
+		Msg("Got credentials, connecting to IMAP server")
+
+	// Create and connect the client
+	client := NewClient(*config)
+
+	// Use a goroutine with context for connection timeout
+	done := make(chan error, 1)
+	go func() {
+		if err := client.Connect(); err != nil {
+			p.log.Error().Err(err).Str("account", accountID).Msg("IMAP Connect failed")
+			done <- err
+			return
+		}
+		p.log.Debug().Str("account", accountID).Msg("IMAP connected, logging in")
+		if err := client.Login(); err != nil {
+			p.log.Error().Err(err).Str("account", accountID).Msg("IMAP Login failed")
+			client.ForceClose()
+			done <- err
+			return
+		}
+		p.log.Debug().Str("account", accountID).Msg("IMAP login successful")
+		if client.IDRequired() && p.idRequiredCallback != nil {
+			p.idRequiredCallback(accountID)
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			// Retry once for "max connections" errors — the server may still
+			// have ghost connections from force-closed sessions (network change).
+			// Wait 15s to give the server time to drop stale connections.
+			if attempt == 0 && strings.Contains(err.Error(), "Maximum number of connections") {
+				p.log.Warn().Str("account", accountID).Msg("Max connections exceeded, retrying after 15s")
+				select {
+				case <-time.After(15 * time.Second):
+					return p.createConnectionWithRetry(ctx, accountID, attempt+1)
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			p.log.Error().Err(err).Str("account", accountID).Msg("Connection failed")
+			return nil, fmt.Errorf("failed to connect: %w", err)
+		}
+	case <-ctx.Done():
+		// Try to close the client if it was created
+		p.log.Warn().Str("account", accountID).Msg("Connection timed out (context cancelled)")
+		go client.ForceClose()
+		return nil, ctx.Err()
+	}
+
+	conn := &PooledConnection{
+		client:    client,
+		accountID: accountID,
+		createdAt: time.Now(),
+		lastUsed:  time.Now(),
+		inUse:     true,
+	}
+
+	p.mu.Lock()
+	p.connections[accountID] = append(p.connections[accountID], conn)
+	p.mu.Unlock()
+
+	p.log.Info().
+		Str("account", accountID).
+		Msg("New connection created")
+
+	return conn, nil
+}
+
+// Release returns a connection to the pool
+func (p *Pool) Release(conn *PooledConnection) {
+	if conn == nil {
+		return
+	}
+
+	conn.mu.Lock()
+	conn.inUse = false
+	healthy := conn.isHealthyLocked()
+	if healthy {
+		conn.lastUsed = time.Now()
+	}
+	conn.mu.Unlock()
+
+	// An unhealthy connection must LEAVE the pool, not merely be withheld from
+	// waiters: GetConnection trusts recently-used connections without a probe,
+	// so a dead one left in the list with a fresh lastUsed would be handed out
+	// again on the next acquisition (the Proton Bridge zombie loop — one closed
+	// socket failing every STATUS/SELECT for an account). Discard force-closes
+	// and removes it.
+	if !healthy {
+		p.log.Debug().
+			Str("account", conn.accountID).
+			Msg("Released connection is unhealthy, discarding")
+		p.Discard(conn)
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Verify the connection is still tracked by the pool before handing it to
+	// a waiter. After CloseAll (sleep), connections from deferred Release
+	// calls must not be given to waiters.
+	inPool := false
+	if conns, ok := p.connections[conn.accountID]; ok {
+		for _, c := range conns {
+			if c == conn {
+				inPool = true
+				break
+			}
+		}
+	}
+	if !inPool {
+		p.log.Debug().
+			Str("account", conn.accountID).
+			Msg("Released connection no longer in pool, discarding")
+		return
+	}
+
+	// Check if anyone is waiting for a connection for this account
+	if waiters, ok := p.waiters[conn.accountID]; ok && len(waiters) > 0 {
+		waiter := waiters[0]
+		p.waiters[conn.accountID] = waiters[1:]
+
+		conn.mu.Lock()
+		conn.inUse = true
+		conn.mu.Unlock()
+
+		waiter <- conn
+		return
+	}
+
+	p.log.Debug().
+		Str("account", conn.accountID).
+		Msg("Connection released to pool")
+}
+
+// Discard removes a connection from the pool without returning it for reuse.
+// Use this when a connection is known to be dead/unhealthy (e.g., after connection errors).
+// Uses ForceClose to avoid blocking on dead TCP sockets.
+func (p *Pool) Discard(conn *PooledConnection) {
+	if conn == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Force-close the connection (known dead, skip graceful logout)
+	conn.mu.Lock()
+	if conn.client != nil {
+		conn.client.ForceClose()
+		conn.client = nil
+	}
+	conn.mu.Unlock()
+
+	// Remove from pool
+	if conns, ok := p.connections[conn.accountID]; ok {
+		for i, c := range conns {
+			if c == conn {
+				p.connections[conn.accountID] = append(conns[:i], conns[i+1:]...)
+				break
+			}
+		}
+		// Clean up empty account entry
+		if len(p.connections[conn.accountID]) == 0 {
+			delete(p.connections, conn.accountID)
+		}
+	}
+
+	p.log.Info().
+		Str("account", conn.accountID).
+		Msg("Discarded dead connection from pool")
+}
+
+// CloseAccount closes all connections for a specific account.
+// Uses ForceClose to avoid blocking on dead TCP sockets (e.g., after network changes).
+func (p *Pool) CloseAccount(accountID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	conns, ok := p.connections[accountID]
+	if !ok {
+		return
+	}
+
+	for _, conn := range conns {
+		conn.mu.Lock()
+		if conn.client != nil {
+			conn.client.ForceClose()
+			conn.client = nil
+		}
+		conn.mu.Unlock()
+	}
+
+	delete(p.connections, accountID)
+
+	// Notify any waiters that we're closing
+	if waiters, ok := p.waiters[accountID]; ok {
+		for _, w := range waiters {
+			close(w)
+		}
+		delete(p.waiters, accountID)
+	}
+
+	p.log.Info().
+		Str("account", accountID).
+		Int("closed", len(conns)).
+		Msg("Closed all connections for account")
+}
+
+// CloseAll closes all connections in the pool
+func (p *Pool) CloseAll() {
+	p.mu.Lock()
+	accountIDs := make([]string, 0, len(p.connections))
+	for accountID := range p.connections {
+		accountIDs = append(accountIDs, accountID)
+	}
+	p.mu.Unlock()
+
+	for _, accountID := range accountIDs {
+		p.CloseAccount(accountID)
+	}
+
+	p.log.Info().Msg("Closed all connections")
+}
+
+// CleanupIdle closes connections that have been idle too long
+func (p *Pool) CleanupIdle() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := time.Now()
+	cleaned := 0
+
+	for accountID, conns := range p.connections {
+		var remaining []*PooledConnection
+
+		for _, conn := range conns {
+			conn.mu.Lock()
+			idle := !conn.inUse && now.Sub(conn.lastUsed) > p.config.IdleTimeout
+			conn.mu.Unlock()
+
+			if idle {
+				conn.mu.Lock()
+				if conn.client != nil {
+					conn.client.ForceClose()
+				}
+				conn.mu.Unlock()
+				cleaned++
+			} else {
+				remaining = append(remaining, conn)
+			}
+		}
+
+		if len(remaining) == 0 {
+			delete(p.connections, accountID)
+		} else {
+			p.connections[accountID] = remaining
+		}
+	}
+
+	if cleaned > 0 {
+		p.log.Info().
+			Int("cleaned", cleaned).
+			Msg("Cleaned up idle connections")
+	}
+}
+
+// StartCleanupRoutine starts a background goroutine that periodically cleans up idle connections
+func (p *Pool) StartCleanupRoutine(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				p.CleanupIdle()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// Client returns the underlying IMAP client from a pooled connection
+func (pc *PooledConnection) Client() *Client {
+	return pc.client
+}

@@ -1,0 +1,10 @@
+Zephyr
+Copyright 2026 Houssem Benhacen
+
+This product includes software derived from Aerion (https://github.com/hkdb/aerion),
+Copyright 2024-2025 Aerion Contributors, licensed under the Apache License, Version 2.0.
+
+Modifications in Zephyr include:
+- Rebranded application identity, icons, and Windows installer metadata
+- Isolated local storage paths, database filename, IPC pipe, and OS keyring service name
+- Updated About dialog, documentation, and repository links

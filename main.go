@@ -1,0 +1,343 @@
+package main
+
+import (
+	"embed"
+	"flag"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+
+	"github.com/hkdb/aerion/app"
+	"github.com/hkdb/aerion/internal/appstate"
+	"github.com/hkdb/aerion/internal/logging"
+	"github.com/hkdb/aerion/internal/platform"
+	"github.com/hkdb/aerion/internal/settings"
+	"github.com/rs/zerolog"
+	"github.com/wailsapp/wails/v2"
+	"github.com/wailsapp/wails/v2/pkg/options"
+	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/linux"
+)
+
+//go:embed all:frontend/dist
+var assets embed.FS
+
+// Command-line flags
+var (
+	debugMode   = flag.Bool("debug", false, "Enable debug logging (same as --log-level debug)")
+	logLevel    = flag.String("log-level", "", "Log level: fatal, error, warn, info, debug (default fatal; env AERION_LOG_LEVEL)")
+	logFile     = flag.String("log-file", "", "Also write logs to this file, 10 MB rollover to <file>.1 (env AERION_LOG_FILE)")
+	composeMode = flag.Bool("compose", false, "Run in composer mode (detached window)")
+	accountID   = flag.String("account", "", "Account ID for composer")
+	ipcAddress  = flag.String("ipc-address", "", "IPC server address to connect to")
+	mode        = flag.String("mode", "new", "Compose mode: new, reply, reply-all, forward")
+	messageID   = flag.String("message-id", "", "Original message ID for reply/forward")
+	draftID     = flag.String("draft-id", "", "Draft ID to resume editing")
+	mailtoFlag  = flag.String("mailto", "", "Mailto URL to open in composer (detached mode)")
+	dbusNotify  = flag.Bool("dbus-notify", false, "Use direct D-Bus notifications instead of portal (Linux only)")
+	versionFlag = flag.Bool("version", false, "Show version and exit")
+)
+
+// DebugMode returns whether debug logging is enabled
+// Can be enabled via --debug flag or AERION_DEBUG=1 environment variable
+func DebugMode() bool {
+	return *debugMode || os.Getenv("AERION_DEBUG") == "1"
+}
+
+// resolveLogConfig turns the logging flags/env vars into a logging.Config.
+// Precedence: --debug / AERION_DEBUG=1 force debug; otherwise --log-level,
+// then AERION_LOG_LEVEL, then fatal. File: --log-file, then AERION_LOG_FILE.
+// An unknown level name is a usage error: fail fast rather than silently
+// logging at the wrong level for a week-long capture.
+func resolveLogConfig() logging.Config {
+	level := *logLevel
+	if level == "" {
+		level = os.Getenv("AERION_LOG_LEVEL")
+	}
+	if level == "" {
+		level = "fatal"
+	}
+	if DebugMode() {
+		level = "debug"
+	}
+	if _, err := zerolog.ParseLevel(level); err != nil {
+		fmt.Fprintf(os.Stderr, "aerion: invalid --log-level %q (want fatal, error, warn, info or debug)\n", level)
+		os.Exit(2)
+	}
+
+	file := *logFile
+	if file == "" {
+		file = os.Getenv("AERION_LOG_FILE")
+	}
+	return logging.Config{Level: level, Console: true, File: file}
+}
+
+func main() {
+	platform.MonitorGBMErrors()
+	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println(app.Version)
+		return
+	}
+
+	// Logging is initialised here, once, for both the main window and
+	// --compose mode (this runs before the composeMode branch).
+	logCfg := resolveLogConfig()
+
+	// On Windows, GUI apps have no console. Allocate one whenever any
+	// console logging was requested (anything below fatal).
+	if logCfg.Level != "fatal" {
+		platform.AttachConsole()
+	}
+	if err := logging.Init(logCfg); err != nil {
+		// A bad --log-file must not block startup; stderr logging still works.
+		fmt.Fprintf(os.Stderr, "aerion: logging init failed: %v\n", err)
+	}
+
+	// Check for mailto: URL in non-flag arguments
+	var mailtoData *app.MailtoData
+	var rawMailtoArg string
+	args := flag.Args()
+	for _, arg := range args {
+		if strings.HasPrefix(strings.ToLower(arg), "mailto:") {
+			mailtoData = app.ParseMailtoURL(arg)
+			rawMailtoArg = arg
+			break
+		}
+	}
+
+	if *composeMode {
+		runComposerMode()
+		return
+	}
+	runMainMode(mailtoData, rawMailtoArg)
+}
+
+// runMainMode runs the main application window
+func runMainMode(mailtoData *app.MailtoData, rawMailtoArg string) {
+	// Determine activation message: pass raw mailto URL if present, otherwise just "show"
+	activateMsg := "show"
+	if rawMailtoArg != "" {
+		activateMsg = rawMailtoArg
+	}
+
+	// Single-instance detection: if another instance is running, activate it and exit
+	lock := platform.NewSingleInstanceLock()
+	locked, err := lock.TryLock(activateMsg)
+	if err != nil {
+		println("Warning: single-instance check failed:", err.Error())
+	}
+	if !locked {
+		// Existing instance was activated
+		return
+	}
+	defer lock.Unlock()
+
+	// Initialize WebKit on the main thread before anything spawns GLib worker
+	// threads — see webkit_preinit_linux.go (#431).
+	preinitWebKit()
+
+	// Read native title bar setting before Wails init (Frameless is init-time only)
+	nativeTitleBar := false
+	// Restore the last window size/maximized state (Width/Height and
+	// WindowStartState are init-time options). Defaults stand on first run.
+	windowWidth, windowHeight := 1280, 800
+	windowStartState := options.Normal
+	if paths, err := platform.GetPaths(); err == nil {
+		nativeTitleBar = settings.ReadNativeTitleBar(paths.DatabasePath())
+		if geo, ok := appstate.ReadWindowGeometry(paths.DatabasePath()); ok {
+			if geo.Width >= 360 && geo.Width <= 10000 && geo.Height >= 400 && geo.Height <= 10000 {
+				windowWidth, windowHeight = geo.Width, geo.Height
+			}
+			if geo.Maximized {
+				windowStartState = options.Maximised
+			}
+		}
+	}
+
+	// Create an instance of the app structure
+	application := app.NewApp(*dbusNotify)
+	application.SingleInstanceLock = lock
+
+	// Store mailto data if provided (will be used after startup)
+	if mailtoData != nil {
+		application.PendingMailto = mailtoData
+	}
+
+	// Run pre-Wails startup checks (paths, DB open, migrations, credential
+	// store). On failure, surface a native error dialog and exit before the
+	// Wails window is created — otherwise the user would see a half-rendered
+	// app window briefly flash before the dialog appears.
+	//
+	// Skipped under the `bindings` build tag — see preflight_bindings.go.
+	runPreflight(application)
+
+	// Create a dummy ComposerApp for binding generation only.
+	// Wails generates JS/TS bindings at build time based on bound structs.
+	// We need ComposerApp bindings for the detached composer window.
+	dummyComposerApp := app.NewComposerApp(app.ComposerConfig{})
+
+	// Create application with options
+	err = wails.Run(&options.App{
+		Title:                    "Zephyr",
+		Width:                    windowWidth,
+		Height:                   windowHeight,
+		MinWidth:                 360,
+		MinHeight:                400,
+		WindowStartState:         windowStartState,
+		Frameless:                !nativeTitleBar,
+		StartHidden:              true, // Hide until frontend is ready to prevent white flash
+		EnableDefaultContextMenu: true,
+		AssetServer: &assetserver.Options{
+			Assets: assets,
+		},
+		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
+		OnStartup:        application.Startup,
+		OnShutdown:       application.Shutdown,
+		OnBeforeClose:    application.BeforeClose,
+		Bind: []interface{}{
+			application,
+			dummyComposerApp, // For binding generation
+		},
+		Linux: &linux.Options{
+			WebviewGpuPolicy: linux.WebviewGpuPolicyOnDemand,
+			ProgramName:      "io.github.zephyr.Zephyr",
+		},
+	})
+
+	if err != nil {
+		println("Error:", err.Error())
+	}
+}
+
+// runComposerMode runs a detached composer window
+func runComposerMode() {
+	// Validate required flags
+	if *accountID == "" {
+		println("Error: --account is required for composer mode")
+		os.Exit(1)
+	}
+	if *ipcAddress == "" {
+		println("Error: --ipc-address is required for composer mode")
+		os.Exit(1)
+	}
+
+	// Validate compose mode
+	switch *mode {
+	case "new", "reply", "reply-all", "forward":
+		// valid
+	default:
+		println("Error: --mode must be one of: new, reply, reply-all, forward")
+		os.Exit(1)
+	}
+
+	// Initialize WebKit on the main thread before anything spawns GLib worker
+	// threads — see webkit_preinit_linux.go (#431).
+	preinitWebKit()
+
+	// Create composer configuration
+	config := app.ComposerConfig{
+		AccountID:  *accountID,
+		IPCAddress: *ipcAddress,
+		Mode:       *mode,
+		MessageID:  *messageID,
+		DraftID:    *draftID,
+		MailtoURL:  *mailtoFlag,
+	}
+
+	// Create composer app
+	composerApp := app.NewComposerApp(config)
+
+	// Determine window title based on mode
+	title := "New Message"
+	switch *mode {
+	case "reply":
+		title = "Reply"
+	case "reply-all":
+		title = "Reply All"
+	case "forward":
+		title = "Forward"
+	}
+	if *draftID != "" {
+		title = "Edit Draft"
+	}
+
+	// Read native title bar setting before Wails init (Frameless is init-time only)
+	composerNativeTitleBar := false
+	if paths, err := platform.GetPaths(); err == nil {
+		composerNativeTitleBar = settings.ReadNativeTitleBar(paths.DatabasePath())
+	}
+
+	// Create a custom asset handler that serves composer.html instead of index.html
+	composerAssetHandler := &composerAssetHandler{assets: assets}
+
+	// Run Wails application for composer window
+	err := wails.Run(&options.App{
+		Title:                    title,
+		Width:                    800,
+		Height:                   600,
+		MinWidth:                 500,
+		MinHeight:                400,
+		Frameless:                !composerNativeTitleBar,
+		StartHidden:              true, // Hide until frontend is ready to prevent white flash
+		EnableDefaultContextMenu: true,
+		AssetServer: &assetserver.Options{
+			// Don't provide Assets here - we use Handler exclusively
+			// so we can rewrite "/" to "/composer.html"
+			Handler: composerAssetHandler,
+		},
+		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
+		OnStartup:        composerApp.Startup,
+		OnShutdown:       composerApp.Shutdown,
+		Bind: []interface{}{
+			composerApp,
+		},
+		Linux: &linux.Options{
+			WebviewGpuPolicy: linux.WebviewGpuPolicyOnDemand,
+			ProgramName:      "io.github.hkdb.Aerion",
+		},
+	})
+
+	if err != nil {
+		println("Error:", err.Error())
+		os.Exit(1)
+	}
+}
+
+// composerAssetHandler serves composer.html instead of index.html for the root request.
+type composerAssetHandler struct {
+	assets embed.FS
+}
+
+// ServeHTTP implements http.Handler.
+// It intercepts requests for "/" and serves composer.html instead.
+func (h *composerAssetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+
+	// Rewrite root path to composer.html
+	if path == "/" || path == "" || path == "/index.html" {
+		path = "/composer.html"
+	}
+
+	// Try to read from the embedded filesystem
+	subFS, err := fs.Sub(h.assets, "frontend/dist")
+	if err != nil {
+		http.Error(w, "Asset not found", http.StatusNotFound)
+		return
+	}
+
+	// Create a modified request with the rewritten path
+	// This is necessary because http.FileServer uses r.URL.Path
+	modifiedReq := new(http.Request)
+	*modifiedReq = *r
+	modifiedReq.URL = new(url.URL)
+	*modifiedReq.URL = *r.URL
+	modifiedReq.URL.Path = path
+
+	// Serve the file with the modified request
+	http.FileServer(http.FS(subFS)).ServeHTTP(w, modifiedReq)
+}

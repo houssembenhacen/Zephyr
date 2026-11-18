@@ -1,0 +1,26 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "zephyr",
+  "outputfilename": "zephyr",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "info": {
+    "companyName": "Houssem Benhacen",
+    "productName": "Zephyr",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright 2026 Houssem Benhacen",
+    "comments": "A modern, lightweight and secure email client",
+    "protocols": [
+      {
+        "scheme": "mailto",
+        "description": "Email"
+      }
+    ]
+  },
+  "author": {
+    "name": "Houssem Benhacen",
+    "email": ""
+  }
+}
