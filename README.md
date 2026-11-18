@@ -81,4 +81,4 @@ Built with [Wails v2](https://wails.io) (Go backend) + [Svelte 5](https://svelte
 
 Licensed under the [Apache License 2.0](LICENSE).  
 Copyright (c) 2026 Houssem Benhacen.  
-Based on [Aerion](https://github.com/hkdb/aerion) (Copyright 2024-2025 Aerion Contributors, Apache License 2.0). See [NOTICE](NOTICE) for details.
+
